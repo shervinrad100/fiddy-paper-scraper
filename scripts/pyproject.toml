@@ -3,14 +3,18 @@ name = "fiddy-paper-scraper"
 version = "0.1.0"
 description = ""
 authors = [
-    {name = "Shervin Rad",email = "shervin.sharifirad@team.bumble.com"}
+    {name = "Shervin Rad",email = "shervinrad100@gmail.com"}
 ]
-readme = "README.md"
+readme = "../README.md"
 requires-python = ">=3.9"
 dependencies = [
     "requests (>=2.32.3,<3.0.0)",
     "beautifulsoup4 (>=4.13.4,<5.0.0)",
-    "google-cloud-storage (>=3.1.0,<4.0.0)"
+    "google-cloud-storage (>=3.1.0,<4.0.0)",
+    "pandas (>=2.2.3,<3.0.0)",
+    "openai (>=1.82.0,<2.0.0)",
+    "pyyaml (>=6.0.2,<7.0.0)",
+    "google-cloud-bigquery (>=3.33.0,<4.0.0)"
 ]
 
 
