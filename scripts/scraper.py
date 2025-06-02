@@ -4,6 +4,7 @@ import yaml
 import openai
 import json
 from lxml import etree
+from io import BytesIO
 
 
 BUCKET_NAME = "fiddy-paper-scraper-patent-raw"
@@ -32,78 +33,6 @@ def download_latest_patents():
     """
     return
 
-def fetch_gcs_files(gcs_client, filter=None):
-    """read patent file from GCS
-    TODO filter for date downloaded again should be configured in airflow
-    """
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    return [blob.name for blob in bucket.list_blobs() if blob.name.endswith(".xml")]
-
-def stream_blob_content(gcs_client, blob_name):
-    """
-    Iterates over the XML one patent at a time (identified by 'us-patent-application')
-    checks to see if the patent is bio related 
-    if it is, it will pull out the title, description, etc and put it in bigquery
-
-    TODO if not bio related store in queue to check with gpt
-    TODO instead of .// search for direct address to optimise
-    TODO more logging
-    """
-    bucket = gcs_client.bucket(BUCKET_NAME)
-    blob = bucket.blob(blob_name)
-
-    with blob.open("rb") as f:
-        print(f'opened file {blob_name}')
-        context = etree.iterparse(f, events=("end", ), tag="us-patent-application", recover=True)
-
-        for _, patent in context:
-            # is it bio related?
-            # ask chatgpt or choose from pre-fitlered codes (more efficient)
-            for cls in patent.findall(".//classification-ipcr"):
-                section = cls.findtext("section")
-                class_ = cls.findtext("class")
-                subclass = cls.findtext("subclass")
-                main_group = cls.findtext("main-group")
-                if section and class_ and subclass and main_group:
-                    code = f"{section}{class_}{subclass}{main_group}"
-            print(code)
-            if code not in IPCR_CODES:
-                patent.clear()
-                continue
-
-            title = patent.findtext(".//invention-title", default="").strip()
-            abstract = patent.find(".//abstract")
-            abstract_text = etree.tostring(abstract, method="text", encoding="unicode").strip() if abstract is not None else ""
-
-            description = patent.find(".//description")
-            description_text = etree.tostring(description, method="text", encoding="unicode").strip()[:5000] if description is not None else ""
-
-            inventors = [] # in case there are multiple
-            for inventor in patent.findall(".//inventor/addressbook"):
-                first = inventor.findtext("first-name", "").strip()
-                last = inventor.findtext("last-name", "").strip()
-                inventors.append((first, last))
-
-            filing_date = patent.findtext(".//application-reference/document-id/date", default="").strip()
-            patent_num = patent.findtext(".//publication-reference/document-id/doc-number", default="").strip()
-
-
-            output = {
-                "title": title,
-                "abstract": abstract_text,
-                "description": description_text,
-                "inventors": inventors,
-                "filing_date": filing_date,
-                "patent_num": patent_num,
-                "ipcr_code": code,
-                "cpc_code": None,
-            }
-            print(output)
-            yield output
-            patent.clear()
-            while patent.getprevious() is not None:
-                del patent.getparent()[0]
-
 def query_openai(xml_text):
     """
     TODO if xml is too large it will error
@@ -126,6 +55,69 @@ def query_openai(xml_text):
         print(f"OpenAI error: {e}")
         return None
 
+def stream_blob_content(source_blob):
+    """
+    Iterates over the XML one patent at a time (identified by 'us-patent-application')
+
+    TODO if not bio related store in queue to check with gpt
+    TODO instead of .// search for direct address to optimise
+    TODO more logging
+    """
+
+    with source_blob.open("rb") as f:
+        print(f'Opened file {source_blob.name}')
+        context = etree.iterparse(f, events=("end", ), tag="us-patent-application", recover=True, huge_tree=True)
+        for _, patent in context:        
+            yield patent
+            print('clearing buffer')
+            patent.clear()
+            # while patent.getprevious() is not None:
+            #     del patent.getparent()[0]
+            print('cleared')
+
+def read_patent(patent):
+    def _extract_classification(patent):
+        for cls in patent.findall(".//classification-ipcr"):
+            section = cls.findtext("section")
+            class_ = cls.findtext("class")
+            subclass = cls.findtext("subclass")
+            main_group = cls.findtext("main-group")
+            if section and class_ and subclass and main_group:
+                code = f"{section}{class_}{subclass}{main_group}"
+        
+        return {
+            "ipcr_code": code,
+            "cpc_code": None,
+        }
+
+    def _extract_fields(patent):
+            title = patent.findtext(".//invention-title", default="").strip()
+            abstract = patent.find(".//abstract")
+            abstract_text = etree.tostring(abstract, method="text", encoding="unicode").strip() if abstract is not None else ""
+
+            description = patent.find(".//description")
+            description_text = etree.tostring(description, method="text", encoding="unicode").strip()[:5000] if description is not None else ""
+
+            inventors = [] # in case there are multiple
+            for inventor in patent.findall(".//inventor/addressbook"):
+                first = inventor.findtext("first-name", "").strip()
+                last = inventor.findtext("last-name", "").strip()
+                inventors.append((first, last))
+
+            filing_date = patent.findtext(".//application-reference/document-id/date", default="").strip()
+            patent_num = patent.findtext(".//publication-reference/document-id/doc-number", default="").strip()
+
+            return {
+                "title": title,
+                "abstract": abstract_text,
+                "description": description_text,
+                "inventors": inventors,
+                "filing_date": filing_date,
+                "patent_num": patent_num,
+            }
+
+    output = {**_extract_fields(patent), **_extract_classification(patent)}
+    return output
 
 def insert_row_to_bq(bq_client, row):
     table_ref = bq_client.dataset(BQ_DATASET).table(BQ_TABLE)
@@ -141,18 +133,22 @@ def insert_row_to_bq(bq_client, row):
 
 def main():
     gcs_client = storage.Client()
+    bucket = gcs_client.bucket(BUCKET_NAME)
     bq_client = bigquery.Client()
 
-    files = fetch_gcs_files(gcs_client)
 
-    for file_name in files:
-        print(f"Processing: {file_name}")
+    files = [blob for blob in bucket.list_blobs() if blob.name.endswith(".xml")]
 
-        for patent in stream_blob_content(gcs_client, file_name):
-            print(patent)
-            patent["source_file"] = file_name
-            patent["tags"] = None # TODO add with gpt
-            insert_row_to_bq(patent)
+    for file in files:
+        print(f"Processing: {file.name}")
+
+        for patent in stream_blob_content(file):
+            row = read_patent(patent)
+            print(row["ipcr_code"])
+            # row["source_file"] = file.name
+            # row["tags"] = None # TODO add with gpt
+            print('patent processed')
+            # insert_row_to_bq(bq_client, {**row, "source_file":file.name, "tags":None})
 
 
 if __name__ == "__main__":

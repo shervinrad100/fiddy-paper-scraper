@@ -9,6 +9,7 @@ resource "google_bigquery_table" "bio_patents" {
   dataset_id = google_bigquery_dataset.patents.dataset_id
   table_id   = "bio_related_patents"
   project    = var.project_id
+  deletion_protection = false
 
   schema = jsonencode([
     { name = "title",         type = "STRING",     mode = "NULLABLE" },
